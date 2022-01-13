@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create the Glue Database and Crawler to make a queryable CloudTrail Logs table for Athena
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: The Organization Id of your organization (omit if you are not using an Org CloudTrail)
+  S3BucketName:
+    Type: String
+    Description: The name of the bucket containing your CloudTrail logs
+  CodeS3BucketName:
+    Type: String
+    Description: The name of the bucket containing the Lambda code
+    Default: gorillastack-autotag-releases
+  CodeS3Key:
+    Type: String
+    Description: The key of the Lambda code zip file in the S3 bucket
+    Default: partitioner-0.1.0.zip
+
+Resources:
+  # We create the Glue table through the Glue Data catalog
+  CloudTrailLogsGlueTable:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseName: default
+      TableInput: 
+        Name: cloudtrail_logs
+        TableType: EXTERNAL_TABLE
+        Parameters: { 
+          "EXTERNAL": "TRUE"
+        }
+        PartitionKeys: 
+          - Name: account
+            Type: string
+          - Name: region
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor: 
+          InputFormat: "com.amazon.emr.cloudtrail.CloudTrailInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          SerdeInfo:
+            SerializationLibrary: "com.amazon.emr.hive.serde.CloudTrailSerde"
+            Parameters: {
+              "serialization.format": "1"
+            }
+          StoredAsSubDirectories: true
+          Location: 
+            Fn::Join: 
+              - ""
+              - - "s3://"
+                - !Ref "S3BucketName"
+                - "/AWSLogs/"
+                - !Ref OrganizationId
+          Columns:
+            -
+              Name: useridentity
+              Type: "struct<type:string,principalid:string,arn:string,accountid:string,invokedby:string,accesskeyid:string,username:string,sessioncontext:struct<attributes:struct<mfaauthenticated:string,creationdate:string>,sessionissuer:struct<type:string,principalid:string,arn:string,accountid:string,username:string>>>"
+            -
+              Name: eventversion
+              Type: string
+            -
+              Name: eventtime
+              Type: string
+            -
+              Name: eventtype
+              Type: string
+            -
+              Name: eventsource
+              Type: string
+            -
+              Name: eventname
+              Type: string
+            -
+              Name: awsregion
+              Type: string
+            -
+              Name: sourceipaddress
+              Type: string
+            -
+              Name: useragent
+              Type: string
+            -
+              Name: errorcode
+              Type: string
+            -
+              Name: errormessage
+              Type: string
+            -
+              Name: requestparameters
+              Type: string
+            -
+              Name: responseelements
+              Type: string
+            -
+              Name: additionaleventdata
+              Type: string
+            -
+              Name: requestid
+              Type: string
+            -
+              Name: eventid
+              Type: string
+            -
+              Name: resources
+              Type: "array<struct<arn:string,accountid:string,type:string>>"
+            -
+              Name: apiversion
+              Type: string
+            -
+              Name: readonly
+              Type: string
+            -
+              Name: recipientaccountid
+              Type: string
+            -
+              Name: serviceeventdetails
+              Type: string
+            -
+              Name: sharedeventid
+              Type: string
+            -
+              Name: vpcendpointid
+              Type: string
+
+  LambdaPartitionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      RoleName: LambdaPartitionerRole-cloudtrail_logs
+      Policies:
+        -
+          PolicyName: "put_logs_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+        -
+          PolicyName: "cloudtrail_logs_bucket_list_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                Resource: !Sub "arn:aws:s3:::${S3BucketName}"
+        -
+          PolicyName: "cloudtrail_logs_bucket_get_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                Resource: !Sub "arn:aws:s3:::${S3BucketName}/AWSLogs/${OrganizationId}/*"
+        -
+          PolicyName: "glue_access_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "glue:BatchCreatePartition"
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/default/${CloudTrailLogsGlueTable}"
+        -
+          PolicyName: "dynamodb_access_policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                Resource:
+                  Fn::GetAtt:
+                    - PartitionTable
+                    - Arn
+
+  # We need a DynamoDB Table to act as a record of which domains have been covered
+  # by our partitions
+  PartitionTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - 
+          AttributeName: "Domain"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "Domain"
+          KeyType: "HASH"
+      TableName: "Athena-CloudTrail-Partitions"
+      BillingMode: PAY_PER_REQUEST
+
+  # The lambda function that is responsible for the creation of required partitions
+  # Much quicker, simpler and cheaper than using a glue crawler, which is overkill
+  PartitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref CodeS3BucketName
+        S3Key: !Ref CodeS3Key
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3BucketName
+          ORGANIZATION_ID: !Ref OrganizationId
+      Handler: "dist/handler.handler"
+      MemorySize: 1024
+      Role:
+        Fn::GetAtt:
+          - LambdaPartitionerRole
+          - Arn
+      Runtime: nodejs14.x
+      Timeout: 300
+
+  ## An event rule to execute the lambda function once a day
+  LambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ScheduledAthenaPartitionEventRule
+      Description: Schedule daily execution of the Athena CloudTrail partitioner
+      ScheduleExpression: cron(0 1 * * ? *)
+      State: 'ENABLED'
+      Targets:
+        -
+          Id: !Ref PartitionLambda
+          Arn:
+            Fn::GetAtt:
+              - PartitionLambda
+              - Arn
